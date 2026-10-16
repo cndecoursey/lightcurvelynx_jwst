@@ -1,7 +1,7 @@
 """LightCurveLynx survey tables for JWST/NIRCam imaging programs, executed or planned.
 
 Every survey is described by one *exposure table*: one row per detector exposure, with
-the columns listed in ``EXPOSURE_COLUMNS``. Three builders produce it:
+the columns listed in ``utils.EXPOSURE_COLUMNS``. Three builders produce it:
 
 * ``exposures_from_apt``   planned programs: an APT ``.aptx`` file (geometry from pysiaf)
 * ``exposures_from_mast``  executed programs: MAST JWST keyword search (no downloads)
@@ -22,12 +22,14 @@ Noise inputs derived per row (all in electrons over the full exposure):
 * ``zp``         = PHOTMJSR * PIXAR_SR * 1e15 / (gain * exptime)           [nJy/e-]
 * ``sky_bg_e``   = sky [MJy/sr] / PHOTMJSR * gain * exptime                [e-/pixel]
 * ``psf_footprint`` = 2.266 (FWHM / pixel scale)^2 (in-flight FWHM)        [pixels]
+
+Instrument constants (gain, read noise, dark current, PSF FWHM, readout patterns, ...)
+are read from ``config/nircam.yaml``; repository paths and small helpers are in ``utils.py``.
 """
 
 from __future__ import annotations
 
 import fnmatch
-import os
 import re
 import warnings
 import xml.etree.ElementTree as ET
@@ -43,142 +45,34 @@ from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from astropy.time import Time
 
-# ======================================================================================
-# Repository layout
-# ======================================================================================
-#
-#   <repo>/data/apt/          APT files (.aptx)
-#   <repo>/data/cal_files/    one subdirectory of stage-2 cal files per program/epoch
-#   <repo>/outputs/           generated tables and figures
-#
-# Set the environment variable JWST_SURVEY_DATA (and/or JWST_SURVEY_OUTPUT) to keep the
-# data or outputs elsewhere, e.g. on an external drive.
+# Repository paths, NIRCam constants (from config/nircam.yaml), and helpers live in utils.py.
+# They are imported here so that they are also available as jwst_survey.<name>.
+from utils import (
+    APT_DIR, CAL_DIR, CONFIG_DIR, DATA_DIR, OUTPUT_DIR, REPO_ROOT, cal_file_paths, output_path,
+    EXPOSURE_COLUMNS, GAUSSIAN_NEA_FACTOR, NIRCAM, NIRCAM_ACTIVE_PIXELS, NIRCAM_CHANNEL_DEFAULTS,
+    NIRCAM_LW_DETECTORS, NIRCAM_PSF_FWHM_ARCSEC, NIRCAM_READOUT_PATTERNS,
+    NIRCAM_REFERENCE_APERTURES, NIRCAM_SW_DETECTORS, NIRCAM_TFRAME_FULL,
+    nircam_channel, nircam_filter, normalize_detector,
+    parse_s_region, polygon_center_rotation, unit_mean,
+)
 
-REPO_ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("JWST_SURVEY_DATA", REPO_ROOT / "data")).expanduser()
-APT_DIR = DATA_DIR / "apt"
-CAL_DIR = DATA_DIR / "cal_files"
-OUTPUT_DIR = Path(os.environ.get("JWST_SURVEY_OUTPUT", REPO_ROOT / "outputs")).expanduser()
-
-
-def cal_file_paths(subdir, pattern="*_cal*.fits"):
-    """Sorted cal-file paths in ``CAL_DIR / subdir`` (or in ``subdir`` if it is absolute)."""
-    folder = Path(subdir).expanduser()
-    if not folder.is_absolute():
-        folder = CAL_DIR / folder
-    paths = sorted(folder.glob(pattern))
-    if not paths:
-        raise FileNotFoundError(f"No files matching {pattern!r} in {folder}")
-    return paths
-
-
-def output_path(*parts):
-    """Path inside ``OUTPUT_DIR``; parent directories are created."""
-    path = OUTPUT_DIR.joinpath(*parts)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-# ======================================================================================
-# Instrument constants
-# ======================================================================================
-
-# Channel-averaged detector properties (JDox, "NIRCam Detector Performance", Table 1).
-NIRCAM_CHANNEL_DEFAULTS = {
-    "SW": {"dark_current": 0.0019, "read_noise_cds": 15.77, "gain": 2.05},  # e-/s/pix, e-, e-/DN
-    "LW": {"dark_current": 0.0342, "read_noise_cds": 13.25, "gain": 1.82},
-}
-
-# In-flight PSF FWHM [arcsec] (JDox, "NIRCam Point Spread Functions", Table 1);
-# model values for F150W2 and F322W2, which have no empirical measurement.
-NIRCAM_PSF_FWHM_ARCSEC = {
-    "F070W": 0.029, "F090W": 0.033, "F115W": 0.040, "F140M": 0.048, "F150W": 0.050,
-    "F150W2": 0.045, "F162M": 0.055, "F164N": 0.056, "F182M": 0.062, "F187N": 0.064,
-    "F200W": 0.066, "F210M": 0.071, "F212N": 0.072,
-    "F250M": 0.085, "F277W": 0.092, "F300M": 0.100, "F322W2": 0.096, "F323N": 0.108,
-    "F335M": 0.111, "F356W": 0.116, "F360M": 0.120, "F405N": 0.136, "F410M": 0.137,
-    "F430M": 0.144, "F444W": 0.145, "F460M": 0.157, "F466N": 0.158, "F470N": 0.160,
-    "F480M": 0.164,
-}
-GAUSSIAN_NEA_FACTOR = np.pi / (2.0 * np.log(2.0))  # NEA = 2.266 FWHM^2 for a Gaussian
-
-# NIRCam readout patterns: (frames averaged per group, frames skipped between groups).
-NIRCAM_READOUT_PATTERNS = {
-    "RAPID": (1, 0), "BRIGHT1": (1, 1), "BRIGHT2": (2, 0), "SHALLOW2": (2, 3),
-    "SHALLOW4": (4, 1), "MEDIUM2": (2, 8), "MEDIUM8": (8, 2), "DEEP2": (2, 18), "DEEP8": (8, 12),
-}
-NIRCAM_TFRAME_FULL = 10.73677  # s, full-frame read time
-
-NIRCAM_SW_DETECTORS = {"A": ["NRCA1", "NRCA2", "NRCA3", "NRCA4"], "B": ["NRCB1", "NRCB2", "NRCB3", "NRCB4"]}
-NIRCAM_LW_DETECTORS = {"A": ["NRCA5"], "B": ["NRCB5"]}
-
-# APT (Module, TargetPlacement) -> SIAF reference aperture whose reference point is
-# placed on the target. Extend as needed for other placements.
-NIRCAM_REFERENCE_APERTURES = {
-    ("ALL", "MODULE_GAP"): "NRCALL_FULL",
-    ("A", "MODULE_CENTER"): "NRCAS_FULL",
-    ("B", "MODULE_CENTER"): "NRCBS_FULL",
-}
-
-# Columns of the standard exposure table.
-EXPOSURE_COLUMNS = [
-    "time", "ra", "dec", "rotation", "footprint_side_deg", "filter", "channel", "detector",
-    "readpatt", "ngroups", "nframes", "nints", "tgroup", "photmjsr", "pixar_sr", "sky_mjysr", "epoch",
+__all__ = [
+    # re-exported from utils.py
+    "APT_DIR", "CAL_DIR", "CONFIG_DIR", "DATA_DIR", "OUTPUT_DIR", "REPO_ROOT", "cal_file_paths", "output_path",
+    "EXPOSURE_COLUMNS", "GAUSSIAN_NEA_FACTOR", "NIRCAM", "NIRCAM_ACTIVE_PIXELS", "NIRCAM_CHANNEL_DEFAULTS",
+    "NIRCAM_LW_DETECTORS", "NIRCAM_PSF_FWHM_ARCSEC", "NIRCAM_READOUT_PATTERNS", "NIRCAM_REFERENCE_APERTURES",
+    "NIRCAM_SW_DETECTORS", "NIRCAM_TFRAME_FULL", "nircam_channel", "nircam_filter", "normalize_detector",
+    "parse_s_region", "polygon_center_rotation", "unit_mean",
+    # defined here
+    "nircam_detector_polygons", "siaf_pixel_area_sr",
+    "read_apt", "exposures_from_apt", "exposures_from_mast", "read_cal_header", "exposures_from_cal",
+    "observed_start_and_v3pa", "reference_lookup", "apply_reference", "ramp_read_noise",
+    "nircam_footprint", "build_nircam_surveys", "five_sigma_depth", "compare_exposure_tables", "stack_epochs",
 ]
 
-_FILTER_RE = re.compile(r"^F\d{3}[WMN]2?$")
-
-
-def nircam_filter(filter_kw, pupil_kw):
-    """Effective NIRCam filter: a filter in the pupil wheel (e.g. F162M behind F150W2) wins."""
-    pupil_kw = (pupil_kw or "").strip().upper()
-    return pupil_kw if _FILTER_RE.match(pupil_kw) else str(filter_kw).strip().upper()
-
-
-def nircam_channel(detector):
-    """'SW' or 'LW' from a detector name such as NRCA1 or NRCALONG / NRCA5."""
-    d = str(detector).upper()
-    return "LW" if ("LONG" in d or d.endswith("5")) else "SW"
-
-
-def normalize_detector(detector):
-    """Use one naming scheme for LW detectors (headers say NRCALONG, SIAF says NRCA5)."""
-    d = str(detector).upper()
-    return d.replace("LONG", "5")
-
-
 # ======================================================================================
-# Footprint geometry
+# Detector footprints (pysiaf)
 # ======================================================================================
-
-
-def _unit_mean(coords):
-    xyz = coords.cartesian.xyz.value.reshape(3, -1).mean(axis=1)
-    sph = SkyCoord(x=xyz[0], y=xyz[1], z=xyz[2], representation_type="cartesian").spherical
-    return SkyCoord(sph.lon, sph.lat)
-
-
-def polygon_center_rotation(ra, dec):
-    """Center, LightCurveLynx rotation and mean side length of a (near-)square polygon.
-
-    LightCurveLynx's ``rotation`` is the position angle (deg east of north) of the
-    footprint's y-axis; for a square detector it is defined modulo 90 degrees.
-    Returns (center_ra, center_dec, rotation_deg, side_deg).
-    """
-    corners = SkyCoord(np.asarray(ra) * u.deg, np.asarray(dec) * u.deg)
-    center = _unit_mean(corners)
-    mid = _unit_mean(corners[0:2])
-    rotation = center.position_angle(mid).deg % 90.0
-    side = corners.separation(np.roll(corners, -1)).deg.mean()
-    return center.ra.deg, center.dec.deg, rotation, float(side)
-
-
-def parse_s_region(s_region):
-    """(ra, dec) vertex arrays of an S_REGION 'POLYGON [ICRS] ...' string, in degrees."""
-    numbers = [float(tok) for tok in str(s_region).split() if re.match(r"^[-+]?\d", tok)]
-    if len(numbers) < 6 or len(numbers) % 2:
-        raise ValueError(f"Cannot parse S_REGION: {s_region!r}")
-    return np.array(numbers[0::2]), np.array(numbers[1::2])
 
 
 def nircam_detector_polygons(ra, dec, v3pa, *, reference_aperture="NRCALL_FULL", detectors=None):
@@ -790,7 +684,7 @@ def _obs_table_class():
     return NIRCamObsTable
 
 
-def nircam_footprint(exposures, *, active_pixels=2040):
+def nircam_footprint(exposures, *, active_pixels=NIRCAM_ACTIVE_PIXELS):
     """Square single-detector footprint sized from the exposures' polygon side lengths."""
     from lightcurvelynx.astro_utils.detector_footprint import DetectorFootprint
 
@@ -849,7 +743,7 @@ def compare_exposure_tables(planned, executed, *, keys=("filter", "detector")):
     """
     def summarize(df):
         g = df.groupby(list(keys))
-        c = g.apply(lambda d: _unit_mean(SkyCoord(d["ra"].to_numpy() * u.deg, d["dec"].to_numpy() * u.deg)),
+        c = g.apply(lambda d: unit_mean(SkyCoord(d["ra"].to_numpy() * u.deg, d["dec"].to_numpy() * u.deg)),
                     include_groups=False)
         return pd.DataFrame({"n": g.size(), "center": c, "rotation": g["rotation"].median(), "time": g["time"].mean()})
 

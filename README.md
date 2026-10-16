@@ -7,7 +7,9 @@ keywords or stage-2 cal files). Developed for the JADES Extended Transient Surve
 ## Layout
 
 ```
-jwst_survey.py        Module: exposure-table builders, NIRCam noise model, LightCurveLynx surveys
+jwst_survey.py        Main module: exposure-table builders, NIRCam noise model, LightCurveLynx surveys
+utils.py              Repository paths, instrument-constant loading, name and geometry helpers
+config/nircam.yaml    NIRCam constants (gain, read noise, dark current, PSF FWHM, readout patterns)
 scripts/              Analysis scripts (run from the repository root)
 tests/                Tests; tests/data/ holds small test inputs
 data/apt/             APT files (.aptx), committed

@@ -5,4 +5,5 @@ pandas
 astropy
 pysiaf
 pyarrow
+pyyaml
 astroquery   # only for exposures_from_mast

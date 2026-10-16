@@ -1,0 +1,85 @@
+# NIRCam instrument constants used by jwst_survey.py (loaded by utils.load_instrument).
+#
+# Edit values here rather than in the code. Every entry states its units and source.
+
+# Channel-averaged detector properties.
+# Source: JDox, "NIRCam Detector Performance", Table 1. Dark current: ground-test
+# values (recommended by JDox over the persistence-affected commissioning values).
+channels:
+  SW:
+    dark_current: 0.0019      # e- / s / pixel   (1.9 e-/ks)
+    read_noise_cds: 15.77     # e- / pixel, correlated double sampling
+    gain: 2.05                # e- / DN
+  LW:
+    dark_current: 0.0342      # e- / s / pixel   (34.2 e-/ks)
+    read_noise_cds: 13.25     # e- / pixel, correlated double sampling
+    gain: 1.82                # e- / DN
+
+# PSF full width at half maximum, arcsec.
+# Source: JDox, "NIRCam Point Spread Functions", Table 1 (in-flight values).
+# F150W2 and F322W2 have no in-flight measurement; the model values are used.
+psf_fwhm_arcsec:
+  F070W: 0.029
+  F090W: 0.033
+  F115W: 0.040
+  F140M: 0.048
+  F150W: 0.050
+  F150W2: 0.045
+  F162M: 0.055
+  F164N: 0.056
+  F182M: 0.062
+  F187N: 0.064
+  F200W: 0.066
+  F210M: 0.071
+  F212N: 0.072
+  F250M: 0.085
+  F277W: 0.092
+  F300M: 0.100
+  F322W2: 0.096
+  F323N: 0.108
+  F335M: 0.111
+  F356W: 0.116
+  F360M: 0.120
+  F405N: 0.136
+  F410M: 0.137
+  F430M: 0.144
+  F444W: 0.145
+  F460M: 0.157
+  F466N: 0.158
+  F470N: 0.160
+  F480M: 0.164
+
+# Readout patterns: [frames averaged per group, frames skipped between groups].
+# Source: JDox, "NIRCam Detector Readout Patterns".
+readout_patterns:
+  RAPID: [1, 0]
+  BRIGHT1: [1, 1]
+  BRIGHT2: [2, 0]
+  SHALLOW2: [2, 3]
+  SHALLOW4: [4, 1]
+  MEDIUM2: [2, 8]
+  MEDIUM8: [8, 2]
+  DEEP2: [2, 18]
+  DEEP8: [8, 12]
+
+tframe_full_s: 10.73677       # s, full-frame read time (TFRAME keyword)
+active_pixels: 2040           # pixels per side, excluding the 4-pixel reference border
+
+# Detectors per channel and module (SIAF names; headers call the LW detectors NRCALONG/NRCBLONG).
+detectors:
+  SW:
+    A: [NRCA1, NRCA2, NRCA3, NRCA4]
+    B: [NRCB1, NRCB2, NRCB3, NRCB4]
+  LW:
+    A: [NRCA5]
+    B: [NRCB5]
+
+# APT Module -> TargetPlacement -> SIAF aperture whose reference point is placed on
+# the target. Add entries here for other placements.
+reference_apertures:
+  ALL:
+    MODULE_GAP: NRCALL_FULL
+  A:
+    MODULE_CENTER: NRCAS_FULL
+  B:
+    MODULE_CENTER: NRCBS_FULL
