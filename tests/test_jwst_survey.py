@@ -123,4 +123,16 @@ assert cmp_obs["offset_arcsec"].max() < 0.5          # sub-pixel dither offsets 
 assert cmp_obs["d_rotation_deg"].abs().max() < 0.5
 assert cmp_obs["d_time_days"].abs().max() * 1440 < 2.0
 
+# 6. Prediction from the APT file alone (no executed data): proposal ID, V3PA constraint
+#    (295-305 deg -> 300 deg) and scheduling window must reproduce epoch 1 approximately.
+apt_info = js.read_apt(APTX)
+assert apt_info.attrs["proposal_id"] == "08060", apt_info.attrs["proposal_id"]
+plan_pred = js.exposures_from_apt(APTX, observations=[1, 2], epoch="Y1E1")
+assert np.allclose(plan_pred["v3pa"], 300.0)
+cmp_pred = js.compare_exposure_tables(plan_pred, observed)
+print(f"APT-only prediction vs JETS epoch 1: offsets max {cmp_pred.offset_arcsec.max():.2f}\", "
+      f"time offsets max {cmp_pred.d_time_days.abs().max() * 24:.2f} h")
+assert cmp_pred["offset_arcsec"].max() < 3.0          # planned roll 300 deg vs executed 301 deg
+assert cmp_pred["d_time_days"].abs().max() < 0.1
+
 print("\nALL CHECKS PASSED")

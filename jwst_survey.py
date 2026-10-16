@@ -179,6 +179,11 @@ def _visit_planner(obs_elem, proposal_id):
             text = e.text
     if text is None:
         return [], []
+    flag = re.search(r'<StVisitSchedulingWindows UpToDate="(\w+)"', text)
+    if flag and flag.group(1).lower() == "false":
+        number = _child_text(obs_elem, "Number")
+        warnings.warn(f"APT obs {number}: Visit Planner data are flagged out of date; re-run the "
+                      "Visit Planner in APT and save the file to refresh the scheduling windows.")
     m = re.search(r'<StVisitSchedulingWindows[^>]*StSchedulingPCF="([^"]+)"', text)
     windows = []
     if m:
@@ -206,13 +211,21 @@ def read_apt(aptx_path):
     else:
         root = ET.parse(path).getroot()
 
+    # Proposal ID: from <ProposalInformation><ProposalID>, zero-padded to the 5 digits used in
+    # the Visit Planner keys. A file can hold planner data for several IDs (e.g. "00000" before
+    # submission, or the ID of a program it was copied from); only the file's own ID is used.
     proposal_id = None
-    for e in root.iter():
-        if _strip(e.tag) == "ToolValue" and e.attrib.get("Name", "").startswith("Visit Planner:"):
-            pid = e.attrib["Name"].split(":")[1]
-            if pid != "00000":
-                proposal_id = pid
-                break
+    for info in root.iter():
+        if _strip(info.tag) == "ProposalInformation":
+            pid = _child_text(info, "ProposalID")
+            if pid and pid.strip().isdigit():
+                proposal_id = f"{int(pid):05d}"
+            break
+    if proposal_id is None:  # no ID yet: most frequent planner ID, preferring a real one over "00000"
+        ids = [e.attrib["Name"].split(":")[1] for e in root.iter()
+               if _strip(e.tag) == "ToolValue" and e.attrib.get("Name", "").startswith("Visit Planner:")]
+        real = [i for i in ids if i != "00000"]
+        proposal_id = max(set(real), key=real.count) if real else ("00000" if ids else None)
 
     targets = {}
     for t in root.iter():
@@ -239,12 +252,15 @@ def read_apt(aptx_path):
                     "readpatt": _child_text(fc, "ReadoutPattern"),
                     "ngroups": int(_child_text(fc, "Groups")), "nints": int(_child_text(fc, "Integrations")),
                 })
-        apa = None
+        # Orient special requirement: Mode "APA" (aperture PA) or "V3PA"; the midpoint of the
+        # allowed range is used (ranges may wrap through 0/360 deg, e.g. 350-10 deg).
+        orient_mode, orient_deg = None, np.nan
         for o in obs.iter():
-            if _strip(o.tag) == "OrientRange" and o.attrib.get("Mode") == "APA":
+            if _strip(o.tag) == "OrientRange" and o.attrib.get("Mode") in ("APA", "V3PA"):
                 lo = float(o.attrib["OrientMin"].split()[0])
                 hi = float(o.attrib["OrientMax"].split()[0])
-                apa = 0.5 * (lo + hi) if abs(hi - lo) < 180 else None
+                orient_mode = o.attrib["Mode"]
+                orient_deg = (lo + 0.5 * ((hi - lo) % 360.0)) % 360.0
         mosaic = [e for e in obs.iter() if _strip(e.tag) == "MosaicParameters"]
         nrows = int(_child_text(mosaic[0], "Rows", 1)) if mosaic else 1
         ncols = int(_child_text(mosaic[0], "Columns", 1)) if mosaic else 1
@@ -255,7 +271,8 @@ def read_apt(aptx_path):
             "module": _child_text(tmpl, "Module"), "placement": _child_text(tmpl, "TargetPlacement"),
             "primary_dither": _child_text(tmpl, "PrimaryDitherType"),
             "subpixel_positions": int(_child_text(tmpl, "SubpixelPositions", 1) or 1),
-            "mosaic": (nrows, ncols), "configs": configs, "apa": apa,
+            "mosaic": (nrows, ncols), "configs": configs,
+            "orient_mode": orient_mode, "orient_deg": orient_deg,
             "windows": windows, "v3pa_ranges": v3pa_ranges,
         })
     obs_table = pd.DataFrame(rows)
@@ -288,9 +305,10 @@ def exposures_from_apt(aptx_path, *, observations, epoch, year_index=0, start_mj
     start_mjd : float, optional
         Start time of the first observation. Default: middle of the selected window.
     v3pa : float, optional
-        V3 position angle (deg). Default: from the APT aperture-PA constraint if present
-        (also applied to observations in the same SameOrientLink), otherwise the middle
-        of the field-of-regard range on the start date (the nominal roll).
+        V3 position angle (deg) at the reference point. Default: the midpoint of the APT
+        orient constraint (Mode V3PA, or Mode APA converted with the reference aperture's
+        V3IdlYAngle), also applied to observations in the same SameOrientLink; otherwise
+        the middle of the field-of-regard range on the start date (the nominal roll).
     dither_overhead_s, filter_overhead_s, obs_overhead_s : float
         Idle time before an exposure at a new subpixel position, before the first
         exposure of a new filter configuration, and between observations. Defaults are
@@ -310,20 +328,26 @@ def exposures_from_apt(aptx_path, *, observations, epoch, year_index=0, start_mj
     if len(sel) != len(observations):
         raise ValueError(f"Observations not found or not NIRCam imaging: {set(observations) - set(sel['obs'])}")
 
-    # Orient: explicit APA on any observation in a SameOrientLink applies to the whole link.
-    def _valid(a):
-        return a is not None and np.isfinite(a)
+    siaf = pysiaf.Siaf("NIRCam")
 
-    apa_by_obs = {o: (a if _valid(a) else None) for o, a in zip(sel["obs"], sel["apa"])}
+    # Orient constraints as V3PA at each observation's reference point. An explicit constraint
+    # on any observation of a SameOrientLink applies to the whole link.
+    def _constraint_v3pa(row):
+        if row["orient_mode"] == "V3PA":
+            return row["orient_deg"]
+        if row["orient_mode"] == "APA":
+            ref_name = NIRCAM_REFERENCE_APERTURES.get((row["module"], row["placement"]))
+            return (row["orient_deg"] - siaf[ref_name].V3IdlYAngle) % 360.0  # APA = V3PA + V3IdlYAngle
+        return None
+
+    v3pa_by_obs = {row["obs"]: _constraint_v3pa(row) for _, row in apt.iterrows()}
     for group in apt.attrs["same_orient"]:
-        known = [apt.loc[apt["obs"] == o, "apa"].iloc[0] for o in group if o in set(apt["obs"])]
-        known = [a for a in known if _valid(a)]
+        known = [v3pa_by_obs[o] for o in group if v3pa_by_obs.get(o) is not None]
         if known:
             for o in group:
-                if o in apa_by_obs and apa_by_obs[o] is None:
-                    apa_by_obs[o] = known[0]
+                if v3pa_by_obs.get(o) is None:
+                    v3pa_by_obs[o] = known[0]
 
-    siaf = pysiaf.Siaf("NIRCam")
     t = start_mjd
     rows = []
     for i_obs, (_, ob) in enumerate(sel.iterrows()):
@@ -343,12 +367,11 @@ def exposures_from_apt(aptx_path, *, observations, epoch, year_index=0, start_mj
         refname = NIRCAM_REFERENCE_APERTURES.get((ob["module"], ob["placement"]))
         if refname is None:
             raise NotImplementedError(f"No reference aperture for {ob['module']}/{ob['placement']}")
-        ref = siaf[refname]
 
         if v3pa is not None:
             pa_v3 = v3pa
-        elif apa_by_obs.get(ob["obs"]) is not None:
-            pa_v3 = apa_by_obs[ob["obs"]] - ref.V3IdlYAngle  # APA = V3PA + V3IdlYAngle
+        elif v3pa_by_obs.get(ob["obs"]) is not None:
+            pa_v3 = v3pa_by_obs[ob["obs"]]
         else:
             ranges = [(tt, r) for tt, r in ob["v3pa_ranges"] if tt <= t]
             if not ranges:
