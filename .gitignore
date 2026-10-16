@@ -1,0 +1,18 @@
+# Stage-2 images: keep the folder and its README, ignore everything else in it
+data/cal_files/*
+!data/cal_files/00README.md
+
+# Generated outputs: keep the folder and its README
+outputs/*
+!outputs/00README.md
+
+# Large data files anywhere except small test files in tests/data
+*.fits
+*.parquet
+!tests/data/*.fits
+
+# Python / Jupyter / macOS
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
