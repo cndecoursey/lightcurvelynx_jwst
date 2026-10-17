@@ -1,5 +1,7 @@
 # lightcurvelynx_jwst
 
+[![tests](https://github.com/cndecoursey/lightcurvelynx_jwst/actions/workflows/tests.yml/badge.svg)](https://github.com/cndecoursey/lightcurvelynx_jwst/actions/workflows/tests.yml)
+
 Observation tables for [LightCurveLynx](https://lightcurvelynx.readthedocs.io) simulations of
 JWST/NIRCam imaging surveys, built from planned programs (APT files) or executed ones (MAST
 keywords or stage-2 cal files). Developed for the JADES Extended Transient Survey (JETS, PID 8060).
