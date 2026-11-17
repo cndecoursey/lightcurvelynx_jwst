@@ -7,3 +7,4 @@ pysiaf
 pyarrow
 pyyaml
 astroquery   # only for exposures_from_mast
+# stpsf      # only for scripts/compute_psf_nea.py (also needs the STPSF data files)

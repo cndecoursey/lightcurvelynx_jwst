@@ -135,4 +135,21 @@ print(f"APT-only prediction vs JETS epoch 1: offsets max {cmp_pred.offset_arcsec
 assert cmp_pred["offset_arcsec"].max() < 3.0          # planned roll 300 deg vs executed 301 deg
 assert cmp_pred["d_time_days"].abs().max() < 0.1
 
+# 7. PSF noise-equivalent area: an STPSF value (here passed directly) is used as-is; filters
+#    without one fall back to the Gaussian approximation, with a warning.
+sw_rows = plan_filled[plan_filled["channel"] == "SW"].reset_index(drop=True)
+NIRCamObsTable = js._obs_table_class()
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    ot = NIRCamObsTable(sw_rows, channel="SW", psf_nea_pix={"F150W": 13.5},
+                        detector_footprint=js.nircam_footprint(sw_rows))
+fp = ot._table.groupby("filter")["psf_footprint"].first()
+assert np.isclose(fp["F150W"], 13.5)
+pix = np.sqrt(sw_rows["pixar_sr"].iloc[0]) * 206264.806
+assert np.isclose(fp["F200W"], js.GAUSSIAN_NEA_FACTOR * (js.NIRCAM_PSF_FWHM_ARCSEC["F200W"] / pix) ** 2, rtol=0.02)
+fallback = [str(w.message) for w in caught if "Gaussian approximation" in str(w.message)]
+assert fallback and "F150W" not in fallback[0] and "F200W" in fallback[0]
+assert np.isclose(js.noise_equivalent_area(np.full((10, 10), 0.01)), 100.0)  # flat PSF: NEA = pixel count
+print(f"\nPSF footprint: F150W {fp['F150W']:.1f} px (STPSF value), F200W {fp['F200W']:.1f} px (Gaussian fallback)")
+
 print("\nALL CHECKS PASSED")

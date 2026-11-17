@@ -97,7 +97,9 @@ for label, tab in (("JETS (cal)", ex), ("APT plan", plan_f)):
         summ["source"] = label; rows.append(summ)
 dep = pd.concat(rows)
 dep["m5_3dither"] = dep["m5_single"] + 1.25 * np.log10(3)
-print("\n6b. Predicted 5-sigma point-source depth (Gaussian NEA, no err_scale):")
+nea_source = (f"STPSF NEA for {sorted(js.NIRCAM_PSF_NEA_PIX)}, Gaussian otherwise" if js.NIRCAM_PSF_NEA_PIX
+              else "Gaussian NEA; run scripts/compute_psf_nea.py for STPSF values")
+print(f"\n6b. Predicted 5-sigma point-source depth ({nea_source}; no err_scale):")
 print(dep.pivot(index="filter", columns="source", values=["m5_single", "m5_3dither"]).round(2).to_string())
 ex.to_csv(js.output_path("jets_epoch1", "exec_jets_Y1E1_cal.csv"), index=False)
 plan_f.to_csv(js.output_path("jets_epoch1", "plan_8060_Y1E1.csv"), index=False)

@@ -21,7 +21,8 @@ Noise inputs derived per row (all in electrons over the full exposure):
 * ``nexposure``  = NINTS
 * ``zp``         = PHOTMJSR * PIXAR_SR * 1e15 / (gain * exptime)           [nJy/e-]
 * ``sky_bg_e``   = sky [MJy/sr] / PHOTMJSR * gain * exptime                [e-/pixel]
-* ``psf_footprint`` = 2.266 (FWHM / pixel scale)^2 (in-flight FWHM)        [pixels]
+* ``psf_footprint`` = PSF noise-equivalent area from STPSF (config/nircam_psf_nea.yaml),
+                      or 2.266 (FWHM / pixel scale)^2 as a fallback          [pixels]
 
 Instrument constants (gain, read noise, dark current, PSF FWHM, readout patterns, ...)
 are read from ``config/nircam.yaml``; repository paths and small helpers are in ``utils.py``.
@@ -35,6 +36,7 @@ import warnings
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +52,7 @@ from astropy.time import Time
 from utils import (
     APT_DIR, CAL_DIR, CONFIG_DIR, DATA_DIR, OUTPUT_DIR, REPO_ROOT, cal_file_paths, output_path,
     EXPOSURE_COLUMNS, GAUSSIAN_NEA_FACTOR, NIRCAM, NIRCAM_ACTIVE_PIXELS, NIRCAM_CHANNEL_DEFAULTS,
+    NIRCAM_PSF_NEA_PIX, load_psf_nea, noise_equivalent_area,
     NIRCAM_LW_DETECTORS, NIRCAM_PSF_FWHM_ARCSEC, NIRCAM_READOUT_PATTERNS,
     NIRCAM_REFERENCE_APERTURES, NIRCAM_SW_DETECTORS, NIRCAM_TFRAME_FULL,
     nircam_channel, nircam_filter, normalize_detector,
@@ -60,6 +63,7 @@ __all__ = [
     # re-exported from utils.py
     "APT_DIR", "CAL_DIR", "CONFIG_DIR", "DATA_DIR", "OUTPUT_DIR", "REPO_ROOT", "cal_file_paths", "output_path",
     "EXPOSURE_COLUMNS", "GAUSSIAN_NEA_FACTOR", "NIRCAM", "NIRCAM_ACTIVE_PIXELS", "NIRCAM_CHANNEL_DEFAULTS",
+    "NIRCAM_PSF_NEA_PIX", "load_psf_nea", "noise_equivalent_area",
     "NIRCAM_LW_DETECTORS", "NIRCAM_PSF_FWHM_ARCSEC", "NIRCAM_READOUT_PATTERNS", "NIRCAM_REFERENCE_APERTURES",
     "NIRCAM_SW_DETECTORS", "NIRCAM_TFRAME_FULL", "nircam_channel", "nircam_filter", "normalize_detector",
     "parse_s_region", "polygon_center_rotation", "unit_mean",
@@ -109,6 +113,11 @@ def nircam_detector_polygons(ra, dec, v3pa, *, reference_aperture="NRCALL_FULL",
     return out
 
 
+# Cache one result per detector: the SIAF is otherwise reloaded for every exposure row
+# (180 times for JETS epoch 1). The cache lives in memory only, so it is emptied when the
+# Python session ends; after updating pysiaf mid-session, restart the kernel or call
+# siaf_pixel_area_sr.cache_clear().
+@lru_cache(maxsize=None)
 def siaf_pixel_area_sr(detector):
     """Nominal pixel solid angle [sr] of a NIRCam detector from the SIAF plate scales."""
     import pysiaf
@@ -664,14 +673,22 @@ def _obs_table_class():
     from lightcurvelynx.obstable.obs_table import ObsTable
 
     class NIRCamObsTable(ObsTable):
-        """ObsTable for one NIRCam channel ("SW" or "LW") built from an exposure table."""
+        """ObsTable for one NIRCam channel ("SW" or "LW") built from an exposure table.
+
+        ``psf_footprint`` (noise-equivalent area, native pixels) is taken, in order of
+        preference, from: a ``psf_footprint`` column; ``psf_nea_pix`` passed here;
+        ``config/nircam_psf_nea.yaml`` (STPSF, see scripts/compute_psf_nea.py); and, for
+        filters with none of these, the Gaussian approximation 2.266 (FWHM / pixel)^2,
+        which underestimates the NEA of the real NIRCam PSF.
+        """
 
         _default_survey_values = {"survey_name": "JWST_NIRCam", "radius": None, "zp_err_mag": 0.0}
 
-        def __init__(self, table, *, channel, psf_fwhm_arcsec=None, **kwargs):
+        def __init__(self, table, *, channel, psf_fwhm_arcsec=None, psf_nea_pix=None, **kwargs):
             channel = channel.upper()
             self.channel = channel
             self.psf_fwhm_arcsec = {**NIRCAM_PSF_FWHM_ARCSEC, **(psf_fwhm_arcsec or {})}
+            self.psf_nea_pix = {**NIRCAM_PSF_NEA_PIX, **(psf_nea_pix or {})}
             survey = {**NIRCAM_CHANNEL_DEFAULTS[channel], "survey_name": f"JWST_NIRCam_{channel}"}
             survey.update(kwargs.pop("survey_values", {}))
             super().__init__(table, **survey, **kwargs)
@@ -699,10 +716,20 @@ def _obs_table_class():
                 sky_e = t["sky_mjysr"].to_numpy() / t["photmjsr"].to_numpy() * gain * exptime
                 self.add_column("sky_bg_e", np.clip(sky_e, 0.0, None))
             if "psf_footprint" not in t.columns:
-                fwhm = t["filter"].map(self.psf_fwhm_arcsec)
-                if fwhm.isna().any():
-                    raise ValueError(f"No PSF FWHM for {sorted(set(t.loc[fwhm.isna(), 'filter']))}")
-                self.add_column("psf_footprint", GAUSSIAN_NEA_FACTOR * (fwhm.to_numpy() / pixel_scale) ** 2)
+                nea = np.array(t["filter"].map(self.psf_nea_pix), dtype=float)  # writable copy
+                gaussian = np.isnan(nea)
+                if gaussian.any():
+                    fwhm = t["filter"].map(self.psf_fwhm_arcsec).to_numpy(dtype=float)
+                    missing = sorted(set(t.loc[gaussian & np.isnan(fwhm), "filter"]))
+                    if missing:
+                        raise ValueError(f"No PSF NEA or FWHM for {missing}")
+                    nea[gaussian] = GAUSSIAN_NEA_FACTOR * (fwhm[gaussian] / pixel_scale[gaussian]) ** 2
+                    warnings.warn(
+                        f"No STPSF noise-equivalent area for {sorted(set(t.loc[gaussian, 'filter']))}; "
+                        "using the Gaussian approximation, which underestimates the NEA (and hence "
+                        "the noise). Run scripts/compute_psf_nea.py to create config/nircam_psf_nea.yaml."
+                    )
+                self.add_column("psf_footprint", nea)
 
     return NIRCamObsTable
 

@@ -5,7 +5,8 @@ Contents
 * Repository layout: ``REPO_ROOT``, ``DATA_DIR``, ``APT_DIR``, ``CAL_DIR``, ``OUTPUT_DIR``,
   ``cal_file_paths``, ``output_path``.
 * Instrument constants, read from ``config/<instrument>.yaml`` by ``load_instrument``
-  and exposed as ``NIRCAM_*`` names.
+  and exposed as ``NIRCAM_*`` names; PSF noise-equivalent areas from
+  ``config/nircam_psf_nea.yaml`` (``load_psf_nea``, ``noise_equivalent_area``).
 * Name helpers: ``nircam_filter``, ``nircam_channel``, ``normalize_detector``.
 * Sky-geometry helpers: ``unit_mean``, ``polygon_center_rotation``, ``parse_s_region``.
 """
@@ -161,8 +162,39 @@ NIRCAM_REFERENCE_APERTURES = {                                  # {(module, plac
     for placement, aperture in placements.items()
 }
 
+# PSF noise-equivalent areas in native pixels, computed with STPSF by
+# scripts/compute_psf_nea.py and stored in config/nircam_psf_nea.yaml. Filters without an
+# entry fall back to the Gaussian approximation below, which underestimates the NEA of the
+# real NIRCam PSF (by about a factor of two for F150W).
+NIRCAM_PSF_NEA_FILE = CONFIG_DIR / "nircam_psf_nea.yaml"
+
+
+def load_psf_nea(path=NIRCAM_PSF_NEA_FILE):
+    """Return {filter: NEA [native pixels]} from the STPSF table, or {} if it does not exist."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    with open(path) as fh:
+        content = yaml.safe_load(fh) or {}
+    return {f: float(v["nea_pix"]) for f, v in (content.get("filters") or {}).items()}
+
+
+NIRCAM_PSF_NEA_PIX = load_psf_nea()
+
 # Noise-equivalent area of a Gaussian PSF: NEA = 4 pi sigma^2 = pi / (2 ln 2) FWHM^2.
 GAUSSIAN_NEA_FACTOR = np.pi / (2.0 * np.log(2.0))  # ~2.266
+
+
+def noise_equivalent_area(psf):
+    """Noise-equivalent area (in pixels of ``psf``) for optimal PSF-fitting photometry.
+
+    For a PSF image p_i normalized to the TOTAL flux of the source (so sum(p_i) <= 1 if
+    part of the light falls outside the image), the background variance of the optimal
+    flux estimate is sigma_pix^2 / sum(p_i^2), hence NEA = 1 / sum(p_i^2). The PSF must not
+    be renormalized to unit sum within a truncated image, which would underestimate the NEA.
+    """
+    p = np.asarray(psf, dtype=float)
+    return 1.0 / np.sum(p * p)
 
 # Columns of the standard exposure table produced by every builder in jwst_survey.py.
 EXPOSURE_COLUMNS = [
